@@ -275,17 +275,44 @@ def simular(df, bud, shf, shx, shl):
     return fc, bd
 
 
+def _barras_mes(series: dict, meses_orden, y_label="M USD", colores=None):
+    """Barras agrupadas con el eje X en orden de CALENDARIO.
+    Streamlit (Vega-Lite) ordena las etiquetas de texto alfabéticamente
+    (Apr, Aug, Dec, ...); con Altair y sort=meses_orden forzamos el orden real.
+    `series` = {'NombreSerie': [valores...]} alineado con `meses_orden`."""
+    import altair as alt
+    filas = [{"Mes": mes, "Serie": s, "Valor": v}
+             for s, vals in series.items() for mes, v in zip(meses_orden, vals)]
+    dfl = pd.DataFrame(filas)
+    color = alt.Color("Serie:N", title=None, legend=alt.Legend(orient="top"),
+                      scale=(alt.Scale(domain=list(series.keys()), range=colores)
+                             if colores else alt.Undefined))
+    return (alt.Chart(dfl).mark_bar()
+            .encode(x=alt.X("Mes:N", sort=list(meses_orden), title=None),
+                    xOffset="Serie:N",
+                    y=alt.Y("Valor:Q", title=y_label),
+                    color=color,
+                    tooltip=["Mes", "Serie", alt.Tooltip("Valor:Q", title=y_label, format=",.1f")]))
+
+
 # =============================================================================
 # 4. INFORME FINANCIERO (Gemini API + respaldo local detallado)
 # =============================================================================
 def _api_key():
-    """Busca la API key de Gemini de forma robusta:
-    1) .streamlit/secrets.toml  (varias convenciones de nombre, incl. sección [gemini])
-    2) campo manual en el panel   3) variable de entorno.
+    """Busca la API key de Gemini de forma robusta, en este orden:
+    1) campo manual pegado en el panel (solo en memoria de la sesión)
+    2) .streamlit/secrets.toml  (varias convenciones de nombre, incl. sección [gemini])
+    3) variable de entorno.
     Formato recomendado en secrets.toml:   GEMINI_API_KEY = "tu_clave"
     (o como sección)                         [gemini]\n    api_key = "tu_clave"
     """
-    try:
+    try:                                       # 1) clave pegada a mano en la app
+        mk = st.session_state.get("gemini_key_manual")
+        if mk and str(mk).strip():
+            return str(mk).strip()
+    except Exception:
+        pass
+    try:                                       # 2) secrets.toml / Secrets de Streamlit Cloud
         s = st.secrets
         for k in ("GEMINI_API_KEY", "gemini_api_key", "GOOGLE_API_KEY", "google_api_key", "api_key"):
             if k in s and s[k]:
@@ -297,7 +324,7 @@ def _api_key():
                     return sec[k]
     except Exception:
         pass
-    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")  # 3) variable de entorno
 
 
 _SYSTEM_CFO = (
@@ -905,11 +932,11 @@ try:
     g1, g2 = st.columns(2)
     with g1:
         st.markdown("**🗓️ Budget mensual 2027 (M USD)** — base vs ajustado")
-        graf_m = pd.DataFrame({
-            'Base': [bud0[m].sum()/1e6 for m in MESES_27],
-            'Ajustado': [bud[m].sum()/1e6 for m in MESES_27],
-        }, index=[m.split('-')[0] for m in MESES_27])
-        st.bar_chart(graf_m, y_label="M USD", stack=False, use_container_width=True)
+        meses_lbl = [m.split('-')[0] for m in MESES_27]
+        ch_m = _barras_mes({'Base': [bud0[m].sum()/1e6 for m in MESES_27],
+                            'Ajustado': [bud[m].sum()/1e6 for m in MESES_27]},
+                           meses_lbl, colores=['#9DB4C8', '#1F4E78'])
+        st.altair_chart(ch_m, use_container_width=True)
     with g2:
         st.markdown("**📈 Trayectoria FY27→FY31 (M USD)**")
         st.line_chart(pd.DataFrame({'Base': [v/1e6 for v in fy_b], 'Ajustado': [v/1e6 for v in fy_adj]},
@@ -919,10 +946,11 @@ try:
     with g3:
         st.markdown("**📊 Budget vs Forecast — 2° sem. 2026 (M USD)**")
         bmes = budget_2026/12
-        graf_h2 = pd.DataFrame({'Budget (mensual)': [bmes/1e6]*7,
-                                'Forecast ajustado': [fcst[m].sum()/1e6 for m in MESES_PROY]},
-                               index=[m.split('-')[0] for m in MESES_PROY])
-        st.bar_chart(graf_h2, y_label="M USD", stack=False, use_container_width=True)
+        meses_h2 = [m.split('-')[0] for m in MESES_PROY]
+        ch_h2 = _barras_mes({'Budget (mensual)': [bmes/1e6]*7,
+                             'Forecast ajustado': [fcst[m].sum()/1e6 for m in MESES_PROY]},
+                            meses_h2, colores=['#9DB4C8', '#1F4E78'])
+        st.altair_chart(ch_h2, use_container_width=True)
     with g4:
         st.markdown("**🌐 Aporte de cada palanca al forecast 2026 (M USD)**")
         ap = {}
@@ -944,9 +972,24 @@ try:
     st.write("---")
     st.subheader("🧠 Informe Financiero (IA)")
     with st.expander("Configuración de Gemini"):
-        st.caption("🔒 La API key se lee de forma privada desde `.streamlit/secrets.toml` "
-                   "(o variable de entorno). No se ingresa ni se guarda en la app.")
         modelo = st.text_input("Modelo", value="gemini-2.5-flash")
+        _k_actual = _api_key()
+        if _k_actual:
+            st.success("🔑 API key detectada (desde secrets / variable de entorno / campo manual).")
+        else:
+            st.warning("🔑 No hay API key configurada → el informe se genera localmente.")
+        manual_key = st.text_input(
+            "Pega aquí tu API key de Gemini (opcional)", type="password",
+            help="Úsalo si no configuraste secrets. La clave se guarda SOLO en memoria de esta "
+                 "sesión: no se sube a GitHub ni se escribe en disco.")
+        if manual_key and manual_key.strip():
+            st.session_state["gemini_key_manual"] = manual_key.strip()
+            st.caption("✅ Clave cargada para esta sesión. Vuelve a generar el informe.")
+        st.caption(
+            "Para dejarla fija y privada:\n"
+            "• **Streamlit Cloud:** Manage app → ⚙️ Settings → **Secrets**, y pega "
+            "`GEMINI_API_KEY = \"tu_clave\"` (NO va en requirements.txt ni en el repo de GitHub).\n"
+            "• **Local:** crea el archivo `.streamlit/secrets.toml` con esa misma línea.")
     if st.button("📝 Generar informe financiero detallado", use_container_width=True):
         pesos = df_f.groupby(df_f['Driver'])['Proyeccion_base'].sum()
         tot = pesos.sum() or 1
