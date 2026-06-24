@@ -109,12 +109,20 @@ _UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
        '(KHTML, like Gecko) Chrome/124.0 Safari/537.36')
 
 
-def _http(url, t=8, intentos=3):
-    """GET con reintentos. Devuelve el texto crudo de la respuesta."""
+def _http(url, t=10, intentos=3):
+    """GET con reintentos. Prefiere requests (mejor SSL/redirects en cloud); cae a urllib."""
     ult = None
+    headers = {'User-Agent': _UA, 'Accept': '*/*'}
     for _ in range(intentos):
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': _UA, 'Accept': '*/*'})
+            import requests
+            r = requests.get(url, headers=headers, timeout=t)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            ult = e
+        try:
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=t) as r:
                 return r.read().decode('utf-8', 'replace')
         except Exception as e:
@@ -142,6 +150,37 @@ def _stooq(sym):
     raise ValueError(f"Stooq sin Close para {sym}")
 
 
+def _yahoo(sym):
+    """Último precio desde Yahoo Finance. Funciona bien desde datacenters/cloud,
+    que es justo donde fallan mindicador y Stooq. Símbolos: 'USDCLP=X', 'CL=F' (WTI),
+    'HG=F' (cobre USD/lb)."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=1d"
+    d = json.loads(_http(url))
+    res = (d.get("chart", {}).get("result") or [{}])[0]
+    meta = res.get("meta", {}) or {}
+    px = meta.get("regularMarketPrice")
+    if px is None:
+        px = meta.get("previousClose") or meta.get("chartPreviousClose")
+    if px is None:                                    # último recurso: último cierre de la serie
+        try:
+            closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+            px = closes[-1] if closes else None
+        except Exception:
+            px = None
+    if px is None:
+        raise ValueError(f"Yahoo sin precio para {sym}")
+    return float(px)
+
+
+def _erapi_clp():
+    """USD->CLP desde open.er-api.com (gratis, sin API key, muy estable en cloud)."""
+    d = json.loads(_http("https://open.er-api.com/v6/latest/USD"))
+    r = (d.get("rates") or {}).get("CLP")
+    if r is None:
+        raise ValueError("er-api sin CLP")
+    return float(r)
+
+
 def _primero(*fuentes):
     """Devuelve el primer fetcher que tenga éxito; si todos fallan, relanza el último error."""
     ult = None
@@ -155,29 +194,38 @@ def _primero(*fuentes):
     raise ult if ult else ValueError("sin fuentes")
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def obtener_precios():
-    res = {}
+    res = {"_errores": {}}
 
     def tryf(k, fn, fb, u):
         try:
             res[k] = {"valor": float(fn()), "estado": "vivo", "unidad": u}
-        except Exception:
+        except Exception as e:
             res[k] = {"valor": float(fb), "estado": "referencia", "unidad": u}
+            res["_errores"][k] = f"{type(e).__name__}: {str(e)[:120]}"
 
-    # USD/CLP: mindicador -> Stooq (usdclp)
-    tryf("dolar", lambda: _primero(lambda: _mindicador("dolar"), lambda: _stooq("usdclp")),
+    # USD/CLP: Yahoo PRIMERO = spot interbancario (~15 min de atraso). mindicador entrega el
+    # "dólar observado" del Banco Central, que es el promedio del DÍA HÁBIL ANTERIOR -> por eso
+    # se veía ~15 pesos atrasado. Lo dejamos solo como respaldo.
+    tryf("dolar", lambda: _primero(lambda: _yahoo("USDCLP=X"),
+                                   lambda: _mindicador("dolar"),
+                                   _erapi_clp,
+                                   lambda: _stooq("usdclp")),
          PRECIO_REF["dolar"], "CLP/USD")
-    # UF: mindicador
     tryf("uf", lambda: _mindicador("uf"), PRECIO_REF["uf"], "CLP")
-    # Cobre: mindicador -> Stooq cobre futuros (hg.f, USD/lb)
-    tryf("cobre", lambda: _primero(lambda: _mindicador("cobre"), lambda: _stooq("hg.f")),
+    # Cobre: Yahoo HG=F (futuro COMEX, casi spot) primero; mindicador/Stooq como respaldo.
+    tryf("cobre", lambda: _primero(lambda: _yahoo("HG=F"),
+                                   lambda: _mindicador("cobre"),
+                                   lambda: _stooq("hg.f")),
          PRECIO_REF["cobre"], "USD/lb")
-    # Crudo: Stooq WTI (wti.us) -> WTI futuros (cl.f) -> Brent (cb.f) como proxy
-    tryf("wti", lambda: _primero(lambda: _stooq("wti.us"), lambda: _stooq("cl.f"), lambda: _stooq("cb.f")),
+    tryf("wti", lambda: _primero(lambda: _yahoo("CL=F"),
+                                 lambda: _stooq("cl.f"),
+                                 lambda: _stooq("wti.us"),
+                                 lambda: _stooq("cb.f")),
          PRECIO_REF["wti"], "USD/bbl")
 
-    # IPC anualizado (suma de los últimos 12 valores mensuales) para indexar mano de obra
+    # IPC anualizado (suma de los últimos 12 valores mensuales)
     try:
         y = datetime.now().year
         serie = json.loads(_http(f"https://mindicador.cl/api/ipc/{y}")).get("serie", [])
@@ -189,8 +237,9 @@ def obtener_precios():
         if not ult12:
             raise ValueError("ipc vacío")
         res["ipc_anual"] = {"valor": float(sum(ult12)), "estado": "vivo", "unidad": "% 12m"}
-    except Exception:
+    except Exception as e:
         res["ipc_anual"] = {"valor": 3.5, "estado": "referencia", "unidad": "% 12m"}
+        res["_errores"]["ipc_anual"] = f"{type(e).__name__}: {str(e)[:120]}"
 
     res["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     return res
@@ -251,72 +300,149 @@ def _api_key():
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
+_SYSTEM_CFO = (
+    "Eres el CFO (analista financiero senior) de una compañía minera chilena. "
+    "Redactas informes ejecutivos para el directorio: claros, cuantitativos, incisivos y "
+    "orientados a la decisión. Usas SIEMPRE las cifras exactas que recibes (no inventas ni "
+    "rellenas datos), interpretas su significado económico para Chile (tipo de cambio, IPC/UF, "
+    "combustible, cobre) y priorizas. Escribes en español, en Markdown limpio."
+)
+
+
 def generar_informe(datos, modelo="gemini-2.5-flash"):
-    """Devuelve (texto, fuente). Intenta Gemini; si no hay clave o falla, informe local."""
+    """Devuelve (texto, fuente). Intenta Gemini con reintentos; si falla, informe local."""
     prompt = _prompt_informe(datos)
     key = _api_key()
-    if key:
+    if not key:
+        return _informe_local(datos), "local (sin API key en secrets.toml)"
+
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{modelo}:generateContent?key={key}")
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": _SYSTEM_CFO}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "topP": 0.95,
+            # IMPORTANTE: en Gemini 2.5/3 el "thinking" consume maxOutputTokens.
+            # Damos holgura (8192) y acotamos el razonamiento (2048) para que SIEMPRE
+            # quede presupuesto para el texto del informe (~700 palabras ≈ 1.200 tokens).
+            "maxOutputTokens": 8192,
+            "thinkingConfig": {"thinkingBudget": 2048},
+        },
+    }).encode("utf-8")
+    headers = {'Content-Type': 'application/json'}
+
+    ult = None
+    for _ in range(3):                                   # reintentos
         try:
-            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-                   f"{modelo}:generateContent?key={key}")
-            body = json.dumps({"contents": [{"parts": [{"text": prompt}]}],
-                               "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048}}).encode()
-            req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=40) as r:
-                data = json.loads(r.read().decode('utf-8'))
-            txt = data["candidates"][0]["content"]["parts"][0]["text"]
-            if not txt or len(txt.strip()) < 80:        # respuesta vacía/cortada -> respaldo
-                return _informe_local(datos), "local (respaldo)"
-            return txt.strip(), "Gemini (" + modelo + ")"
+            try:
+                import requests
+                r = requests.post(url, data=body, headers=headers, timeout=90)
+                r.raise_for_status()
+                data = r.json()
+            except Exception:
+                req = urllib.request.Request(url, data=body, headers=headers)
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    data = json.loads(r.read().decode('utf-8'))
+            # error explícito de la API (modelo inexistente, key inválida, cuota, etc.)
+            if isinstance(data, dict) and data.get("error"):
+                ult = Exception(str(data["error"].get("message", data["error"]))[:160])
+                continue
+            cand = (data.get("candidates") or [{}])[0]
+            parts = cand.get("content", {}).get("parts", [])
+            txt = "\n".join(p.get("text", "") for p in parts if "text" in p).strip()
+            fr = cand.get("finishReason")
+            if txt and len(txt) >= 120:
+                return txt, "Gemini (" + modelo + ")"
+            # respuesta vacía/truncada -> registra la causa REAL para el diagnóstico
+            ult = Exception(f"respuesta corta (finishReason={fr}, len={len(txt)})")
         except Exception as e:
-            return _informe_local(datos) + f"\n\n> Nota: no se pudo usar Gemini ({e}); resumen generado localmente.", "local"
-    return _informe_local(datos), "local"
+            ult = e
+    # tras agotar reintentos -> respaldo local (con la causa real, no genérica)
+    return _informe_local(datos), f"local (Gemini: {type(ult).__name__}: {str(ult)[:90]})"
 
 
 def _prompt_informe(d):
-    return f"""Eres un analista financiero senior de una minera chilena. Redacta un RESUMEN EJECUTIVO BREVE
-en español (Markdown), de 200 a 320 palabras, como feedback para la gerencia. NO pongas un título principal
-(ya va dentro de una sección). NO repitas tablas de cifras (ya están en el informe). Usa exactamente estas 3
-subsecciones con encabezados '### ':
-### Lectura de la ejecución 2026
-(1 párrafo: interpreta la desviación Forecast vs Budget y qué la explica)
-### Sensibilidades
-(1 párrafo: qué palanca pesa más y por qué, con lectura económica)
-### Recomendaciones
-(3 o 4 viñetas accionables y concretas)
-Sé incisivo y orientado a decisión; menciona 2 o 3 cifras clave, sin saturar.
+    return f"""Actúa como un analista financiero senior (CFO) de una compañía minera chilena. Redacta un
+INFORME FINANCIERO EJECUTIVO en español, en Markdown, completo y orientado a decisión, de 450 a 700 palabras.
+NO incluyas un título de nivel '#' (ya va dentro de una sección numerada). NO repitas tablas extensas de cifras
+(ya están impresas antes en el informe). Usa EXACTAMENTE estos encabezados de nivel '### ', en este orden:
 
-DATOS (USD): Budget 2026 {d['budget_2026']:,.0f}; Forecast 2026 {d['forecast_adj']:,.0f};
-Desviación {d['desv']:,.0f} ({d['desv_pct']:.2f}%); Shocks Combustible {d['shf']:+.1f}%, Divisas {d['shx']:+.1f}%,
-Mano de obra {d['shl']:+.1f}%; Impacto en forecast: Combustible {d['imp_fuel']:,.0f}, Divisas {d['imp_fx']:,.0f},
-Mano de obra {d['imp_labor']:,.0f}; Pesos del gasto: Combustible {d['w_fuel']:.1f}%, Divisas {d['w_fx']:.1f}%,
-Mano de obra {d['w_labor']:.1f}%, Local {d['w_local']:.1f}%; Budget FY27 {d['fy_adj'][0]} -> FY31 {d['fy_adj'][4]},
-CAGR {d['cagr']:.2f}%; Mercado: USD/CLP {d['px']['dolar']['valor']:.1f}, WTI {d['px']['wti']['valor']:.1f},
-Cobre {d['px']['cobre']['valor']:.2f}, IPC 12m {d['px']['ipc_anual']['valor']:.1f}%."""
+### Resumen ejecutivo
+(2-3 frases con el mensaje central para el directorio.)
+
+### Ejecución 2026 — Forecast 5+7
+(Analiza la desviación del Forecast frente al Budget 2026, qué la explica, y el rol del run-rate de 5 meses
+reales + 7 proyectados. Interpreta si es ahorro o presión de costos.)
+
+### Budget 2027-2031
+(Analiza la trayectoria FY27→FY31, el salto inicial y la desaceleración posterior, el CAGR, y qué áreas/clasificaciones
+concentran el gasto. Comenta la calidad del plan quinquenal.)
+
+### Sensibilidades de mercado
+(Combustible, divisas y mano de obra: cuál apalanca más el resultado y por qué, con lectura económica para Chile.)
+
+### Riesgos
+(2-3 riesgos clave, priorizados.)
+
+### Recomendaciones
+(4-5 viñetas accionables, concretas y priorizadas.)
+
+Sé incisivo, cuantitativo y ejecutivo. Cita las cifras clave que correspondan.
+
+DATOS (USD):
+- Budget FY 2026: {d['budget_2026']:,.0f}
+- Forecast FY 2026 (con shocks): {d['forecast_adj']:,.0f}  | base sin shocks: {d['forecast_base']:,.0f}
+- Desviación Forecast vs Budget 2026: {d['desv']:,.0f} ({d['desv_pct']:.2f}%)
+- Shocks aplicados: Combustible {d['shf']:+.1f}%, Divisas {d['shx']:+.1f}%, Mano de obra {d['shl']:+.1f}%
+- Impacto de cada palanca en el forecast 2026: Combustible {d['imp_fuel']:,.0f}, Divisas {d['imp_fx']:,.0f}, Mano de obra {d['imp_labor']:,.0f}
+- Peso del gasto por driver: Combustible {d['w_fuel']:.1f}%, Divisas {d['w_fx']:.1f}%, Mano de obra {d['w_labor']:.1f}%, Local/IPC {d['w_local']:.1f}%
+- Budget quinquenal BASE (FY27..FY31): {d['fy_base']}
+- Budget quinquenal CON SHOCKS (FY27..FY31): {d['fy_adj']}  | CAGR 2027-2031 (con shocks): {d['cagr']:.2f}%
+- Top áreas por gasto FY27: {d.get('top_areas', 'n/d')}
+- Top clasificaciones por gasto FY27: {d.get('top_clasif', 'n/d')}
+- Mercado en vivo: USD/CLP {d['px']['dolar']['valor']:.1f}, WTI {d['px']['wti']['valor']:.1f}, Cobre {d['px']['cobre']['valor']:.2f} USD/lb, IPC 12m {d['px']['ipc_anual']['valor']:.1f}%."""
 
 
 def _informe_local(d):
     signo = "sobre-ejecución (presión de costos)" if d['desv'] > 0 else "ahorro frente al presupuesto"
     palanca = max([("combustible", d['imp_fuel']), ("divisas", d['imp_fx']),
                    ("mano de obra", d['imp_labor'])], key=lambda t: abs(t[1]))[0]
-    return f"""### Lectura de la ejecución 2026
-El Forecast 5+7 proyecta un cierre de **USD {d['forecast_adj']:,.0f}** frente a un budget de
-**USD {d['budget_2026']:,.0f}**, una desviación de **USD {d['desv']:,.0f} ({d['desv_pct']:+.2f}%)** — situación de
-**{signo}**. La proyección combina 5 meses reales con 7 estimados, por lo que solo la porción proyectada
-reacciona a las palancas de mercado bajo los supuestos vigentes (combustible {d['shf']:+.1f}%, divisas
-{d['shx']:+.1f}%, mano de obra {d['shl']:+.1f}%).
+    fy = d['fy_adj']
+    return f"""### Resumen ejecutivo
+El Forecast 5+7 proyecta un cierre 2026 de **USD {d['forecast_adj']:,.0f}** frente a un budget de
+**USD {d['budget_2026']:,.0f}**: una desviación de **USD {d['desv']:,.0f} ({d['desv_pct']:+.2f}%)**, situación de
+**{signo}**. El plan 2027-2031 crece a un CAGR de **{d['cagr']:.2f}%**, con la exposición cambiaria como principal
+fuente de riesgo.
 
-### Sensibilidades
+### Ejecución 2026 — Forecast 5+7
+La proyección combina 5 meses reales (YTD) con 7 estimados por run-rate; solo la porción proyectada reacciona a
+las palancas de mercado. Con los supuestos vigentes (combustible {d['shf']:+.1f}%, divisas {d['shx']:+.1f}%,
+mano de obra {d['shl']:+.1f}%), el forecast pasa de USD {d['forecast_base']:,.0f} (base) a USD {d['forecast_adj']:,.0f}.
+
+### Budget 2027-2031
+La trayectoria FY27→FY31 ({fy[0]} → {fy[4]}) muestra un crecimiento que se desacelera tras el primer año,
+consistente con escalamientos contractuales y de costos. Las áreas y clasificaciones de mayor gasto concentran
+la operación: {d.get('top_clasif', 'Contractors, S&C y Spare Parts')}.
+
+### Sensibilidades de mercado
 La palanca de mayor impacto en este escenario es **{palanca}**. Estructuralmente, **divisas** concentra el mayor
 apalancamiento ({d['w_fx']:.1f}% del gasto proyectado): una depreciación del peso encarece de inmediato insumos
-y repuestos importados. Combustible ({d['w_fuel']:.1f}%) y mano de obra ({d['w_labor']:.1f}%) agregan volatilidad
-adicional. El plan quinquenal crece a un CAGR de **{d['cagr']:.2f}%** hacia FY31.
+y repuestos importados. Combustible ({d['w_fuel']:.1f}%) y mano de obra ({d['w_labor']:.1f}%) añaden volatilidad
+pro-cíclica.
+
+### Riesgos
+- Riesgo cambiario elevado por la alta proporción de gasto importado ({d['w_fx']:.1f}%).
+- Exposición a precio de combustible en la operación minera.
+- Reajustes de mano de obra por indexación (UF/IPC {d['px']['ipc_anual']['valor']:.1f}%).
 
 ### Recomendaciones
 - Coberturas de tipo de cambio para la fracción importada del gasto ({d['w_fx']:.1f}%).
 - Cláusulas de indexación y contratos de combustible para acotar su volatilidad.
 - Monitoreo mensual del run-rate 5+7 frente al budget para anticipar desviaciones.
 - Gestionar las líneas de mayor impacto identificadas en "Líneas más impactadas".
+- Revisar el plan de capex/opex de las áreas de mayor gasto en el quinquenio.
 """
 
 
@@ -347,32 +473,151 @@ def _charts(rep):
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter
     except Exception:
         return []
+
+    # ---- estilo común (legible al imprimir en PDF) ----
+    plt.rcParams.update({'font.size': 9, 'axes.titlesize': 11, 'axes.titleweight': 'bold'})
+    AZUL, GRIS, ROJO, VERDE, AZUL2 = '#1F4E78', '#9DB4C8', '#C0392B', '#2E7D50', '#4F81BD'
+    MUSD = FuncFormatter(lambda v, _: f'{v:,.0f}')
+
+    def _grid(ax, eje='y'):
+        ax.grid(axis=eje, color='#E3E8EE', lw=.8, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.tick_params(labelsize=8)
+
+    def _lbl(ax, bars, fmt='{:,.1f}', vert=True, fs=7.5):
+        for b in bars:
+            if vert:
+                v = b.get_height()
+                ax.annotate(fmt.format(v), (b.get_x() + b.get_width()/2, v),
+                            ha='center', va='bottom' if v >= 0 else 'top', fontsize=fs,
+                            xytext=(0, 2 if v >= 0 else -2), textcoords='offset points')
+            else:
+                v = b.get_width()
+                ax.annotate(fmt.format(v), (v, b.get_y() + b.get_height()/2),
+                            ha='left' if v >= 0 else 'right', va='center', fontsize=fs,
+                            xytext=(3 if v >= 0 else -3, 0), textcoords='offset points')
+
     out = []
-    # 1. Budget mensual 2027
-    fig, ax = plt.subplots(figsize=(7, 3), dpi=130)
+
+    # 1. Budget mensual 2027 — base vs ajustado
+    base = [v/1e6 for v in rep['bud_mensual_base']]
+    adj = [v/1e6 for v in rep['bud_mensual_adj']]
+    cambia = any(abs(a - b) > 1e-9 for a, b in zip(adj, base))
+    fig, ax = plt.subplots(figsize=(7.4, 3.2), dpi=140)
     x = range(12); w = 0.4
-    ax.bar([i - w/2 for i in x], [v/1e6 for v in rep['bud_mensual_base']], w, label='Base', color='#9DB4C8')
-    ax.bar([i + w/2 for i in x], [v/1e6 for v in rep['bud_mensual_adj']], w, label='Ajustado', color='#1F4E78')
-    ax.set_xticks(list(x)); ax.set_xticklabels(rep['meses27_labels'], fontsize=7)
-    ax.set_title('Budget mensual 2027 (M USD): base vs ajustado', fontsize=9, weight='bold')
-    ax.legend(fontsize=7); ax.spines[['top', 'right']].set_visible(False); ax.tick_params(labelsize=7)
+    ax.bar([i - w/2 for i in x], base, w, label='Base', color=GRIS, zorder=3)
+    if cambia:
+        ax.bar([i + w/2 for i in x], adj, w, label='Ajustado', color=AZUL, zorder=3)
+    ttl = 'Budget mensual 2027 (M USD)'
+    if cambia:
+        ttl += f'  ·  efecto shocks: {sum(adj)-sum(base):+,.1f} M USD/año'
+    ax.set_title(ttl)
+    ax.set_xticks(list(x)); ax.set_xticklabels(rep['meses27_labels'])
+    ax.set_ylabel('M USD'); ax.yaxis.set_major_formatter(MUSD)
+    if cambia:
+        ax.legend(fontsize=8, frameon=False)
+    _grid(ax)
     out.append(_png(fig)); plt.close(fig)
-    # 2. Trayectoria FY27-31
-    fig, ax = plt.subplots(figsize=(7, 2.8), dpi=130)
-    ax.plot(rep['fy_labels'], [v/1e6 for v in rep['fy_b']], 'o-', label='Base', color='#9DB4C8')
-    ax.plot(rep['fy_labels'], [v/1e6 for v in rep['fy_adj']], 'o-', label='Ajustado', color='#1F4E78')
-    ax.set_title('Trayectoria Budget 2027-2031 (M USD)', fontsize=9, weight='bold')
-    ax.legend(fontsize=7); ax.spines[['top', 'right']].set_visible(False); ax.tick_params(labelsize=7)
+
+    # 2. Trayectoria FY27-31 con etiquetas de valor
+    fb = [v/1e6 for v in rep['fy_b']]; fa = [v/1e6 for v in rep['fy_adj']]
+    cambia2 = any(abs(a - b) > 1e-9 for a, b in zip(fa, fb))
+    fig, ax = plt.subplots(figsize=(7.4, 3.0), dpi=140)
+    ax.plot(rep['fy_labels'], fb, 'o-', label='Base', color=GRIS, lw=2, ms=6, zorder=3)
+    if cambia2:
+        ax.plot(rep['fy_labels'], fa, 'o-', label='Ajustado', color=AZUL, lw=2, ms=6, zorder=4)
+        ax.fill_between(range(5), fb, fa, color=AZUL, alpha=.08, zorder=2)
+    for i, v in enumerate(fa if cambia2 else fb):
+        ax.annotate(f'{v:,.0f}', (i, v), ha='center', va='bottom', fontsize=8,
+                    xytext=(0, 6), textcoords='offset points', weight='bold')
+    ax.set_title('Trayectoria Budget 2027-2031 (M USD)')
+    ax.set_ylabel('M USD'); ax.yaxis.set_major_formatter(MUSD); ax.margins(y=.18)
+    if cambia2:
+        ax.legend(fontsize=8, frameon=False)
+    _grid(ax)
     out.append(_png(fig)); plt.close(fig)
-    # 3. Aporte por palanca
-    fig, ax = plt.subplots(figsize=(7, 2.4), dpi=130)
+
+    # 3. Aporte de cada palanca al forecast 2026
     labs = list(rep['impactos'].keys()); vals = [v/1e6 for v in rep['impactos'].values()]
-    ax.barh(labs, vals, color=['#C0392B' if v < 0 else '#2E7D50' for v in vals])
-    ax.set_title('Aporte de cada palanca al forecast 2026 (M USD)', fontsize=9, weight='bold')
-    ax.axvline(0, color='#888', lw=.8); ax.spines[['top', 'right']].set_visible(False); ax.tick_params(labelsize=7)
+    fig, ax = plt.subplots(figsize=(7.4, 2.6), dpi=140)
+    bars = ax.barh(labs, vals, color=[ROJO if v < 0 else VERDE for v in vals], zorder=3)
+    _lbl(ax, bars, fmt='{:+,.2f}', vert=False)
+    ax.axvline(0, color='#888', lw=.8)
+    ax.set_title('Aporte de cada palanca al forecast 2026 (M USD)')
+    ax.xaxis.set_major_formatter(MUSD); ax.margins(x=.20)
+    _grid(ax, eje='x')
     out.append(_png(fig)); plt.close(fig)
+
+    # 4. Puente 2026 -> 2027 (waterfall consolidado: principales movimientos + 'Otros')
+    if rep.get('bridge'):
+        br = rep['bridge']
+        pasos = sorted(br['steps'], key=lambda s: abs(s[1]), reverse=True)
+        top = pasos[:6]
+        resto = sum(v for _, v in pasos[6:])
+        if abs(resto) > 1e-9:
+            top = top + [('Otros', resto)]
+        labels = [br['start_label']] + [s[0] for s in top] + [br['end_label']]
+        n = len(labels)
+        fig, ax = plt.subplots(figsize=(7.8, 3.6), dpi=140)
+        ax.bar(0, br['start']/1e6, 0.6, color=AZUL, zorder=3)
+        running = br['start']; levels = [running]
+        for i, (_, v) in enumerate(top, 1):
+            bottom = (running if v >= 0 else running + v) / 1e6
+            ax.bar(i, abs(v)/1e6, 0.6, bottom=bottom, color=(AZUL2 if v >= 0 else ROJO), zorder=3)
+            ax.annotate(f'{v/1e6:+,.0f}', (i, (running + v/2)/1e6), ha='center', va='center',
+                        fontsize=6.5, color=('white' if abs(v)/1e6 > 12 else '#333'))
+            running += v; levels.append(running)
+        ax.bar(n-1, br['end']/1e6, 0.6, color='#7A1E12', zorder=3)
+        for i in range(n-1):                     # conectores entre barras (nivel acumulado)
+            ax.plot([i+0.3, i+1-0.3], [levels[i]/1e6, levels[i]/1e6],
+                    color='#9AA7B4', lw=.8, ls='--', zorder=2)
+        ax.set_xticks(range(n)); ax.set_xticklabels(labels, fontsize=7, rotation=30, ha='right')
+        ax.set_title('Puente presupuestario 2026 -> 2027 (M USD)')
+        ax.set_ylabel('M USD'); ax.yaxis.set_major_formatter(MUSD)
+        _grid(ax)
+        out.append(_png(fig)); plt.close(fig)
+
+    # 5. Dona: % por Clasificación (Budget FY27), top-7 + 'Otros', con leyenda de valores
+    if rep.get('donut'):
+        items = sorted(rep['donut'].items(), key=lambda kv: kv[1], reverse=True)
+        top = items[:7]
+        resto = sum(v for _, v in items[7:])
+        if resto > 0:
+            top = top + [('Otros', resto)]
+        kk = [k for k, _ in top]; vv = [v for _, v in top]; tot = sum(vv) or 1
+        fig, ax = plt.subplots(figsize=(7.2, 3.6), dpi=140)
+        cols = plt.cm.Blues_r([0.20 + 0.55*i/max(1, len(vv)-1) for i in range(len(vv))])
+        wed, _ = ax.pie(vv, startangle=90, colors=cols,
+                        wedgeprops=dict(width=0.42, edgecolor='white'))
+        ax.set_title('Distribución del Budget FY27 por Clasificación')
+        leg = [f'{k} — {v/1e6:,.0f} M ({v/tot*100:.0f}%)' for k, v in top]
+        ax.legend(wed, leg, loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=7.5, frameon=False)
+        out.append(_png(fig)); plt.close(fig)
+
+    # 6. Top áreas por gasto: FY27 vs FY31 (barras agrupadas, mucho más legible que 5 líneas)
+    if rep.get('areas'):
+        ar = rep['areas']; ger = ar['gerencias']
+        s27 = ar['series']['FY27']; s31 = ar['series']['FY31']
+        order = sorted(range(len(ger)), key=lambda i: s27[i], reverse=True)[:8][::-1]
+        ger_t = [ger[i] for i in order]
+        v27 = [s27[i]/1e6 for i in order]; v31 = [s31[i]/1e6 for i in order]
+        fig, ax = plt.subplots(figsize=(7.6, 3.8), dpi=140)
+        y = range(len(ger_t)); h = 0.38
+        b1 = ax.barh([i + h/2 for i in y], v27, h, label='FY27', color=GRIS, zorder=3)
+        b2 = ax.barh([i - h/2 for i in y], v31, h, label='FY31', color=AZUL, zorder=3)
+        _lbl(ax, b1, fmt='{:,.0f}', vert=False, fs=6.5)
+        _lbl(ax, b2, fmt='{:,.0f}', vert=False, fs=6.5)
+        ax.set_yticks(list(y)); ax.set_yticklabels(ger_t, fontsize=7.5)
+        ax.set_title('Top áreas por gasto: FY27 vs FY31 (M USD)')
+        ax.xaxis.set_major_formatter(MUSD); ax.margins(x=.18)
+        ax.legend(fontsize=8, frameon=False, loc='lower right')
+        _grid(ax, eje='x')
+        out.append(_png(fig)); plt.close(fig)
+
     return out
 
 
@@ -544,7 +789,15 @@ try:
     c3, c4 = st.sidebar.columns(2)
     c3.metric("Cobre USD/lb", f"{px['cobre']['valor']:,.2f}", b(px['cobre']['estado']))
     c4.metric("IPC 12m", f"{px['ipc_anual']['valor']:,.1f}%", b(px['ipc_anual']['estado']))
-    st.sidebar.caption(f"Actualizado: {px['timestamp']} · mindicador.cl / Stooq")
+    st.sidebar.caption(f"Actualizado: {px['timestamp']} · Yahoo Finance (spot) · mindicador.cl · er-api")
+    _errs = px.get("_errores", {})
+    _vivos = sum(1 for k in ['dolar', 'uf', 'cobre', 'wti', 'ipc_anual'] if px[k]['estado'] == 'vivo')
+    if _errs:
+        with st.sidebar.expander(f"🔧 Diagnóstico de conexión ({_vivos}/5 en vivo)"):
+            for k, msg in _errs.items():
+                st.write(f"🔴 **{k}**: {msg}")
+            st.caption("Si todo falla en Streamlit Cloud suele ser bloqueo de IP del datacenter "
+                       "o SSL. Usa el botón Actualizar; los que fallen usan valor de referencia.")
 
     var_fuel = var_pct(px['wti']['valor'], PRECIO_REF['wti'])
     var_fx = var_pct(px['dolar']['valor'], PRECIO_REF['dolar'])
@@ -625,16 +878,26 @@ try:
 
     # ---------------- KPIs de exposición / sensibilidad ----------------
     st.subheader("Exposición a Volatilidad · % del gasto proyectado por driver")
+    st.caption("El **%** es la composición estructural del gasto proyectado (+7) por driver: qué "
+               "fracción está expuesta a cada palanca. **No cambia con los sliders** (cambia solo "
+               "si cambias los filtros de VP/Gerencia). El monto **en gris** sí reacciona: es el "
+               "impacto en USD de ese shock al nivel actual del slider (0% ⇒ USD 0).")
     _pesos = df_f.groupby('Driver')['Proyeccion_base'].sum()
     _tot = _pesos.sum() or 1
+    _hlp_pct = ("% del gasto proyectado clasificado en este driver. Es exposición estructural: "
+                "no depende de los shocks, solo de la composición del presupuesto filtrado.")
     x1, x2, x3, x4 = st.columns(4)
     x1.metric("⛽ Combustible", f"{_pesos.get('Combustible', 0)/_tot*100:.1f}%",
-              f"USD {simular(df_f, bud_f, shf, 0, 0)[0]['Forecast FY'].sum()-fc_base:,.0f}", delta_color="off")
+              f"USD {simular(df_f, bud_f, shf, 0, 0)[0]['Forecast FY'].sum()-fc_base:,.0f}",
+              delta_color="off", help=_hlp_pct + " El monto gris = impacto del shock de combustible actual.")
     x2.metric("💱 Divisas (importado)", f"{_pesos.get('Divisas', 0)/_tot*100:.1f}%",
-              f"USD {simular(df_f, bud_f, 0, shx, 0)[0]['Forecast FY'].sum()-fc_base:,.0f}", delta_color="off")
+              f"USD {simular(df_f, bud_f, 0, shx, 0)[0]['Forecast FY'].sum()-fc_base:,.0f}",
+              delta_color="off", help=_hlp_pct + " El monto gris = impacto del shock de tipo de cambio actual.")
     x3.metric("👷 Mano de obra", f"{_pesos.get('Mano de Obra', 0)/_tot*100:.1f}%",
-              f"USD {simular(df_f, bud_f, 0, 0, shl)[0]['Forecast FY'].sum()-fc_base:,.0f}", delta_color="off")
-    x4.metric("🏭 Local / IPC", f"{_pesos.get('Local / IPC', 0)/_tot*100:.1f}%", "no sensible", delta_color="off")
+              f"USD {simular(df_f, bud_f, 0, 0, shl)[0]['Forecast FY'].sum()-fc_base:,.0f}",
+              delta_color="off", help=_hlp_pct + " El monto gris = impacto del shock de mano de obra actual.")
+    x4.metric("🏭 Local / IPC", f"{_pesos.get('Local / IPC', 0)/_tot*100:.1f}%", "no sensible",
+              delta_color="off", help=_hlp_pct + " No reacciona a los shocks de mercado (combustible/divisas/MO).")
 
     st.write("---")
 
@@ -695,13 +958,28 @@ try:
         w_labor = pesos.get('Mano de Obra', 0)/tot*100
         w_local = pesos.get('Local / IPC', 0)/tot*100
 
+        # --- datos para los gráficos del informe (puente, dona, áreas) ---
+        b26_cl = fcst.groupby('Classif')['Budget FY'].sum()
+        b27_cl = bud.groupby('Classif')['FY27'].sum()
+        clasifs = sorted(set(b26_cl.index) | set(b27_cl.index))
+        steps = [(c, float(b27_cl.get(c, 0) - b26_cl.get(c, 0))) for c in clasifs]
+        bridge = {'start_label': 'Budget 2026', 'start': float(b26_cl.sum()),
+                  'steps': steps, 'end_label': 'Budget 2027', 'end': float(b27_cl.sum())}
+        donut = {c: float(b27_cl.get(c, 0)) for c in clasifs if b27_cl.get(c, 0) > 0}
+        areas_g = bud.groupby('Gerencia')[FY_COLS].sum().sort_values('FY27', ascending=False)
+        areas = {'gerencias': [str(g).replace('Gerencia ', '')[:24] for g in areas_g.index.tolist()],
+                 'series': {fy: areas_g[fy].tolist() for fy in FY_COLS}}
+        top_clasif = ", ".join(f"{c} ({v/1e6:,.0f}M)" for c, v in b27_cl.sort_values(ascending=False).head(3).items())
+        top_areas = ", ".join(f"{g} ({areas_g.loc[g, 'FY27']/1e6:,.0f}M)" for g in areas_g.head(3).index)
+
         # datos para la narrativa (Gemini / local)
         datos = dict(
             budget_2026=budget_2026, forecast_base=fc_base, forecast_adj=fc_total,
             desv=desv, desv_pct=desv_pct, shf=shf, shx=shx, shl=shl,
             imp_fuel=imp_fuel, imp_fx=imp_fx, imp_labor=imp_labor,
             fy_base=[f"{v:,.0f}" for v in fy_b], fy_adj=[f"{v:,.0f}" for v in fy_adj],
-            cagr=cagr*100, px=px, w_fuel=w_fuel, w_fx=w_fx, w_labor=w_labor, w_local=w_local)
+            cagr=cagr*100, px=px, w_fuel=w_fuel, w_fx=w_fx, w_labor=w_labor, w_local=w_local,
+            top_clasif=top_clasif, top_areas=top_areas)
 
         # datos completos para el PDF (KPIs + gráficos + tablas)
         rep = dict(
@@ -720,6 +998,7 @@ try:
             shf=shf, shx=shx, shl=shl, imp_fuel=imp_fuel, imp_fx=imp_fx, imp_labor=imp_labor,
             w_fuel=w_fuel, w_fx=w_fx, w_labor=w_labor, w_local=w_local, px=px,
             movers=[(r['Desc Item'], r['VP'], r['Driver'], r['Δ FY27']) for _, r in movers.iterrows()],
+            bridge=bridge, donut=donut, areas=areas,
         )
         with st.spinner("Redactando informe y generando PDF..."):
             texto, fuente = generar_informe(datos, modelo)
@@ -733,15 +1012,22 @@ try:
         st.session_state['informe_pdf'] = pdf_bytes
 
     if st.session_state.get('informe_txt'):
-        st.success(f"Informe generado · análisis: {st.session_state.get('informe_fuente')}")
-        st.markdown(st.session_state['informe_txt'])
+        fuente = st.session_state.get('informe_fuente', '')
+        if str(fuente).startswith('Gemini'):
+            st.success(f"✅ Informe generado con {fuente}")
+        else:
+            st.warning(f"⚠️ Análisis generado localmente ({fuente}). Revisa el 🔧 Diagnóstico "
+                       "o que la API key esté en secrets.toml. El informe igual queda completo.")
         if st.session_state.get('informe_pdf'):
             st.download_button("📄 Descargar informe completo (PDF)", st.session_state['informe_pdf'],
                                file_name="Informe_Financiero.pdf", mime="application/pdf",
                                use_container_width=True)
+            with st.expander("👁️ Ver análisis en pantalla (opcional)"):
+                st.markdown(st.session_state['informe_txt'])
         else:
             st.info(f"Para el PDF con gráficos instala: `pip install fpdf2 matplotlib`. "
                     f"{st.session_state.get('informe_pdf_error', '')}")
+            st.markdown(st.session_state['informe_txt'])
             st.download_button("📥 Descargar informe (.md)", st.session_state['informe_txt'].encode(),
                                file_name="Informe_Financiero.md", mime="text/markdown",
                                use_container_width=True)
